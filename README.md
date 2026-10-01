@@ -14,7 +14,7 @@ Machine's built-in DDNS client (inadyn, "custom" provider).
 |---|---|---|
 | Record updated | 200 | `good <ip>` |
 | Record already holds the IP (and TTL) — no write | 200 | `nochg <ip>` |
-| Missing / wrong credentials | 401 + `WWW-Authenticate: Basic` | `badauth` |
+| Missing / wrong credentials | 401 (see note on `WWW-Authenticate` below) | `badauth` |
 | `hostname` missing, repeated, or not the configured record | 200 | `nohost` |
 | Neither `myip` nor the request source is a public IPv4 | 400 | `badip` |
 | Internal error (SSM, Route 53, a conflicting record at the name, out of time) | 500 | `911` |
@@ -40,8 +40,8 @@ without a well-formed `Authorization: Basic` header are rejected before anything
 else is touched.
 
 **Logging.** One bare JSON line per request on stdout with `request_id`, `hostname`,
-`ip`, `ip_source`, `result` (bare JSON so the alarm's `{ $.result = "911" }` metric
-filter can match it). The Authorization header, the password and the raw query
+`ip`, `ip_source`, `result`, which the alarm's `{ $.result = "911" }` metric filter
+matches. The Authorization header, the password and the raw query
 string are never logged. Logs go to `/aws/lambda/<stack-name>` with 30-day retention.
 
 **Abuse throttle.** `ReservedConcurrentExecutions: 2`. Requests beyond 2 concurrent
@@ -63,6 +63,12 @@ Checked against the sources rather than assumed:
   `get_encoded_user_passwd()` in
   [src/ddns.c](https://github.com/troglobit/inadyn/blob/98e43d7db4b9c8e0989a790dda435075f4f78770/src/ddns.c)).
   The header is sent pre-emptively; inadyn never waits for a 401 challenge.
+- **`WWW-Authenticate` doesn't reach clients.** The function sets
+  `WWW-Authenticate: Basic realm="ddns"` on 401s, but Lambda Function URLs rename that
+  reserved response header to `x-amzn-Remapped-WWW-Authenticate` (observed on the
+  deployed stack). inadyn and `curl -u` are unaffected because they send credentials
+  up front; a browser won't show a login prompt. Restoring the header would need
+  CloudFront in front, which is out of scope.
 - **inadyn treats `nochg` as success**, so the endpoint returns `nochg <ip>` as-is. The
   generic plugin's `response()` first requires HTTP 200, then does a case-insensitive
   substring match against `OK good true updated success nochg`
