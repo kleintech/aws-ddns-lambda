@@ -127,8 +127,9 @@ Resources:
   AlarmTopic:
     Type: AWS::SNS::Topic
     Condition: HasAlarmEmail
+    # Not encrypted with alias/aws/sns: CloudWatch alarms cannot publish to a topic using the
+    # AWS managed key (its key policy can't grant cloudwatch.amazonaws.com). Alarm text only.
     Properties:
-      KmsMasterKeyId: alias/aws/sns
       Subscription:
         - Protocol: email
           Endpoint: !Ref AlarmEmail

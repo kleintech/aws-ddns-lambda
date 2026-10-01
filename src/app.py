@@ -18,19 +18,34 @@ from botocore.config import Config
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+# botocore logs response bodies at DEBUG, which would include the decrypted credential.
+logging.getLogger("botocore").setLevel(logging.INFO)
 
 HOSTED_ZONE_ID = os.environ["HOSTED_ZONE_ID"]
 RECORD_NAME = os.environ["RECORD_NAME"].lower().rstrip(".")
 TTL = int(os.environ["TTL"])
 CREDENTIAL_PARAM_NAME = os.environ["CREDENTIAL_PARAM_NAME"]
 
-# Keep worst-case AWS calls well inside the 10s function timeout.
-_BOTO_CONFIG = Config(connect_timeout=2, read_timeout=3, retries={"max_attempts": 2, "mode": "standard"})
+# Worst case per AWS call: 2 attempts x (1s connect + 2s read) = 6s. _require_time() refuses
+# to start a call that could outlive the 10s function timeout, so a slow AWS API yields a
+# logged 911 instead of an unlogged timeout.
+_BOTO_CONFIG = Config(connect_timeout=1, read_timeout=2, retries={"total_max_attempts": 2, "mode": "standard"})
+_CALL_BUDGET_MS = 6500
 ssm = boto3.client("ssm", config=_BOTO_CONFIG)
 route53 = boto3.client("route53", config=_BOTO_CONFIG)
 
 # "user:pass" as bytes, loaded once per execution environment (cold start).
 _credentials = None
+
+
+class ConflictingRecordError(Exception):
+    """The name holds a record this function must not overwrite (alias, routing policy, CNAME)."""
+
+
+def _require_time(context):
+    remaining = getattr(context, "get_remaining_time_in_millis", None)
+    if remaining is not None and remaining() < _CALL_BUDGET_MS:
+        raise TimeoutError("not enough time left for another AWS call")
 
 
 def _response(status, body, headers=None):
@@ -43,7 +58,9 @@ def _response(status, body, headers=None):
 
 def _log(request_id, result, hostname=None, ip=None, ip_source=None):
     # Never log the Authorization header, the credentials, or the raw query string.
-    logger.info(
+    # Printed rather than logged so each line is bare JSON (no runtime "[INFO]\t..." prefix),
+    # which the template's { $.result = "911" } metric filter requires.
+    print(
         json.dumps(
             {
                 "request_id": request_id,
@@ -52,13 +69,15 @@ def _log(request_id, result, hostname=None, ip=None, ip_source=None):
                 "ip_source": ip_source,
                 "result": result,
             }
-        )
+        ),
+        flush=True,
     )
 
 
-def _load_credentials():
+def _load_credentials(context):
     global _credentials
     if _credentials is None:
+        _require_time(context)
         value = ssm.get_parameter(Name=CREDENTIAL_PARAM_NAME, WithDecryption=True)["Parameter"]["Value"]
         value = value.rstrip("\r\n")
         user, sep, password = value.partition(":")
@@ -100,11 +119,12 @@ def _global_ipv4(value):
         addr = ipaddress.IPv4Address(value.strip())
     except ValueError:
         return None
-    return str(addr) if addr.is_global else None
+    return str(addr) if addr.is_global and not addr.is_multicast else None
 
 
-def _current_values(record_fqdn):
-    """Return (values, ttl) of the existing simple A record, or (None, None)."""
+def _current_values(record_fqdn, context):
+    """Return (values, ttl) of the existing simple A record, or (None, None) if there is none."""
+    _require_time(context)
     resp = route53.list_resource_record_sets(
         HostedZoneId=HOSTED_ZONE_ID,
         StartRecordName=record_fqdn,
@@ -112,7 +132,13 @@ def _current_values(record_fqdn):
         MaxItems="1",
     )
     for rrset in resp.get("ResourceRecordSets", []):
-        if rrset["Name"].lower() == record_fqdn and rrset["Type"] == "A" and "SetIdentifier" not in rrset:
+        if rrset["Name"].lower() != record_fqdn:
+            continue
+        # An UPSERT would silently replace an alias, or fail forever against a CNAME or a
+        # routing-policy record; refuse instead so the alarm surfaces the misconfiguration.
+        if rrset["Type"] == "CNAME" or "AliasTarget" in rrset or "SetIdentifier" in rrset:
+            raise ConflictingRecordError(f"{rrset['Type']} record at the name is not a simple A record")
+        if rrset["Type"] == "A":
             return [rr["Value"] for rr in rrset.get("ResourceRecords", [])], rrset.get("TTL")
     return None, None
 
@@ -120,7 +146,7 @@ def _current_values(record_fqdn):
 def handler(event, context):
     request_id = getattr(context, "aws_request_id", None)
     try:
-        return _handle(event, request_id)
+        return _handle(event, context, request_id)
     except Exception:
         # The traceback never contains the request headers or the stored credential.
         logger.exception("internal error request_id=%s", request_id)
@@ -128,7 +154,7 @@ def handler(event, context):
         return _response(500, "911")
 
 
-def _handle(event, request_id):
+def _handle(event, context, request_id):
     http = event.get("requestContext", {}).get("http", {})
     if http.get("method") != "GET":
         _log(request_id, "badmethod")
@@ -143,7 +169,7 @@ def _handle(event, request_id):
     if supplied is None:
         _log(request_id, "badauth")
         return unauthorized
-    if not hmac.compare_digest(supplied, _load_credentials()):
+    if not hmac.compare_digest(supplied, _load_credentials(context)):
         _log(request_id, "badauth")
         return unauthorized
 
@@ -163,11 +189,12 @@ def _handle(event, request_id):
         return _response(400, "badip")
 
     record_fqdn = RECORD_NAME + "."
-    values, ttl = _current_values(record_fqdn)
+    values, ttl = _current_values(record_fqdn, context)
     if values == [ip] and ttl == TTL:
         _log(request_id, "nochg", hostname=RECORD_NAME, ip=ip, ip_source=ip_source)
         return _response(200, f"nochg {ip}")
 
+    _require_time(context)
     route53.change_resource_record_sets(
         HostedZoneId=HOSTED_ZONE_ID,
         ChangeBatch={
