@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Minimal dyndns2-compatible Route 53 updater (single A record) behind a Lambda Function URL.
+
+Parameters:
+  HostedZoneId:
+    Type: String
+    Description: Route 53 public hosted zone ID that contains RecordName.
+    AllowedPattern: "^Z[A-Z0-9]{1,32}$"
+  RecordName:
+    Type: String
+    Description: FQDN of the A record to manage. Lowercase, no trailing dot (e.g. home.example.com).
+    AllowedPattern: "^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$"
+    ConstraintDescription: lowercase FQDN without a trailing dot
+  Ttl:
+    Type: Number
+    Default: 60
+    MinValue: 1
+    MaxValue: 86400
+  CredentialParamName:
+    Type: String
+    Description: SSM SecureString parameter (encrypted with aws/ssm) holding "user:pass". Must start with "/".
+    Default: /route53-ddns/credentials
+    AllowedPattern: "^/[A-Za-z0-9_.\\-/]{1,1010}$"
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional. If set, an SNS topic and an error alarm are created and this address is subscribed.
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+  DdnsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}
+      RetentionInDays: 30
+
+  DdnsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ddns
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt DdnsLogGroup.Arn
+              - Sid: ReadCredential
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CredentialParamName}
+              - Sid: ReadRecord
+                Effect: Allow
+                Action: route53:ListResourceRecordSets
+                Resource: !Sub arn:${AWS::Partition}:route53:::hostedzone/${HostedZoneId}
+              - Sid: UpsertOneARecord
+                Effect: Allow
+                Action: route53:ChangeResourceRecordSets
+                Resource: !Sub arn:${AWS::Partition}:route53:::hostedzone/${HostedZoneId}
+                Condition:
+                  ForAllValues:StringEquals:
+                    route53:ChangeResourceRecordSetsNormalizedRecordNames:
+                      - !Ref RecordName
+                    route53:ChangeResourceRecordSetsRecordTypes:
+                      - A
+                    route53:ChangeResourceRecordSetsActions:
+                      - UPSERT
+
+  DdnsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.handler
+      Runtime: python3.13
+      Architectures:
+        - arm64
+      MemorySize: 128
+      Timeout: 10
+      ReservedConcurrentExecutions: 2
+      Role: !GetAtt DdnsRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref DdnsLogGroup
+        LogFormat: Text
+      Environment:
+        Variables:
+          HOSTED_ZONE_ID: !Ref HostedZoneId
+          RECORD_NAME: !Ref RecordName
+          TTL: !Ref Ttl
+          CREDENTIAL_PARAM_NAME: !Ref CredentialParamName
+
+  DdnsFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref DdnsFunction
+      AuthType: NONE
+
+  # Public Function URLs need both permissions (InvokeFunction scoped to URL invocations only).
+  DdnsUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DdnsFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  DdnsUrlInvokeFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DdnsFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  # The handler turns internal errors into a "911" response, which Lambda does not count
+  # as an Error, so the alarm also counts 911 results from the logs.
+  InternalErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: HasAlarmEmail
+    Properties:
+      LogGroupName: !Ref DdnsLogGroup
+      FilterPattern: '{ $.result = "911" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub Route53Ddns/${AWS::StackName}
+          MetricName: InternalErrors
+          MetricValue: "1"
+
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmEmail
+    Properties:
+      AlarmDescription: !Sub "${AWS::StackName}: Lambda errors or 911 responses in the last hour"
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      Metrics:
+        - Id: total
+          Expression: FILL(errors, 0) + FILL(internal, 0)
+          Label: Errors plus 911 responses
+          ReturnData: true
+        - Id: errors
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref DdnsFunction
+            Period: 3600
+            Stat: Sum
+        - Id: internal
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub Route53Ddns/${AWS::StackName}
+              MetricName: InternalErrors
+            Period: 3600
+            Stat: Sum
+
+Outputs:
+  FunctionUrl:
+    Description: Function URL. UniFi "Server" = host part + /nic/update?hostname=%h&myip=%i
+    Value: !GetAtt DdnsFunctionUrl.FunctionUrl
+  FunctionName:
+    Value: !Ref DdnsFunction
+  LogGroup:
+    Value: !Ref DdnsLogGroup

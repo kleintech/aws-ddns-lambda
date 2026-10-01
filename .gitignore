@@ -1,0 +1,12 @@
+# Deployment config stays local: it holds account-specific values (zone ID, hostname, email).
+samconfig.toml
+samconfig.yaml
+.aws-sam/
+.env
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
